@@ -1,137 +1,72 @@
-import os, datetime as dt, requests, pandas as pd, yfinance as yf
-from dateutil.relativedelta import relativedelta
+import os
+from datetime import datetime
+import yfinance as yf
+import requests
 
-SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+# Slack credentials from GitHub secrets
+SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = os.environ["SLACK_CHANNEL_ID"]
 
-# ---- Watchlist (Canada focus) ----
-TICKERS = {
-    # US Benchmarks
-    "SPY":"S&P 500", "QQQ":"Nasdaq 100", "IWM":"Russell 2000",
+def fetch_stats(tickers):
+    """Fetch last close, percent change and volume for each ticker."""
+    stats = []
+    for ticker in tickers:
+        # Download last two days of daily data for each ticker
+        data = yf.Ticker(ticker).history(period="2d", interval="1d")
+        if data.empty:
+            continue
+        # Latest close and previous close (if available)
+        last_close = data["Close"].iloc[-1]
+        prev_close = data["Close"].iloc[-2] if len(data) >= 2 else last_close
+        # Compute percent change relative to previous close
+        pct_change = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+        volume = data["Volume"].iloc[-1]
+        stats.append({
+            "ticker": ticker,
+            "last_close": float(last_close),
+            "pct_change": float(pct_change),
+            "volume": int(volume),
+        })
+    return stats
 
-    # Canada Broad Market
-    "XIU.TO":"S&P/TSX 60", "XIC.TO":"TSX Capped Composite",
-    "ZCN.TO":"TSX Composite", "HXT.TO":"TSX 60 (swap)",
+def build_message(stats):
+    """Build a Slack message summarizing stock stats."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"*\ud83d\udcc5 Market Digest – {today}*"]
+    for item in stats:
+        lines.append(
+            f"`{item['ticker']}`: Close ${item['last_close']:.2f}, "
+            f"Change {item['pct_change']:+.2f}%, Vol {item['volume']:,}"
+        )
+    return "\n".join(lines)
 
-    # Banks (Big 6)
-    "RY.TO":"Royal Bank", "TD.TO":"TD Bank", "BNS.TO":"Scotiabank",
-    "BMO.TO":"Bank of Montreal", "CM.TO":"CIBC", "NA.TO":"National Bank",
-
-    # Energy / Pipelines
-    "CNQ.TO":"Canadian Natural", "SU.TO":"Suncor",
-    "ENB.TO":"Enbridge", "TRP.TO":"TC Energy", "CVE.TO":"Cenovus",
-
-    # Telecom
-    "BCE.TO":"BCE", "T.TO":"TELUS", "RCI-B.TO":"Rogers",
-
-    # Tech / IT
-    "SHOP.TO":"Shopify (TSX)", "CSU.TO":"Constellation Software", "GIB-A.TO":"CGI",
-
-    # Materials / Gold
-    "ABX.TO":"Barrick Gold", "AEM.TO":"Agnico Eagle", "WPM.TO":"Wheaton Precious",
-
-    # Utilities
-    "FTS.TO":"Fortis", "EMA.TO":"Emera", "AQN.TO":"Algonquin",
-
-    # Sector ETFs
-    "XEG.TO":"iShares Energy", "XFN.TO":"iShares Financials", "ZEB.TO":"BMO Eq-Weight Banks",
-}
-
-def pct(a,b): return (a/b-1.0)*100 if b and b!=0 else 0.0
-
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).rolling(period).mean()
-    down = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = up / (down.replace(0, 1e-9))
-    return 100 - (100 / (1 + rs))
-
-def post_slack(text):
-    requests.post(
+def post_to_slack(text):
+    """Post a message to the configured Slack channel."""
+    response = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-        data={"channel": SLACK_CHANNEL, "text": text, "mrkdwn": True},
+        json={"channel": SLACK_CHANNEL, "text": text},
         timeout=20,
     )
+    # Raise if request failed or Slack reports an error
+    if response.status_code != 200 or not response.json().get("ok", False):
+        raise RuntimeError(f"Slack API error: {response.text}")
 
 def main():
-    end   = dt.datetime.utcnow()
-    start = end - relativedelta(months=13)
-    syms = list(TICKERS.keys())
-
-    data = yf.download(syms, start=start, end=end, auto_adjust=True, progress=False)
-    if "Close" not in data:
-        post_slack("❌ Market Digest: No price data (Yahoo blocked or tickers invalid).")
+    tickers = ["SHOP.TO", "TD.TO", "RY.TO", "BNS.TO", "ENB.TO"]
+    stats = fetch_stats(tickers)
+    if not stats:
+        post_to_slack("\u26a0\ufe0f Market Digest: No data available for tickers.")
         return
-    closes = data["Close"]
-
-    lines = [f"*Daily Market Digest — {dt.datetime.now().strftime('%Y-%m-%d')}*"]
-
-    rows = []
-    for t in syms:
-        try:
-            s = closes[t].dropna()
-        except Exception:
-            continue
-        if len(s) < 60:
-            continue
-        last = float(s.iloc[-1])
-        prev = float(s.iloc[-2]) if len(s) > 1 else last
-        w_ago = float(s.iloc[-6]) if len(s) > 5 else float(s.iloc[0])
-        lookback = s.tail(252)
-        hi52  = float(lookback.max())
-        lo52  = float(lookback.min())
-        rsi14 = float(rsi(s).iloc[-1])
-
-        rows.append({
-            "sym": t, "name": TICKERS[t],
-            "px": last,
-            "1d%": pct(last, prev),
-            "5d%": pct(last, w_ago),
-            "fromHi%": pct(last, hi52),
-            "fromLo%": pct(last, lo52),
-            "RSI14": rsi14
-        })
-
-    if not rows:
-        post_slack("❌ Market Digest: No rows computed (check tickers/network).")
-        return
-
-    df = pd.DataFrame(rows).sort_values("1d%", ascending=False)
-
-    top = df.nlargest(5, "1d%")
-    bot = df.nsmallest(5, "1d%")
-
-    def fmt_row(r):
-        return (f"*{r['name']}* ({r['sym']}): {r['px']:.2f} | "
-                f"1d {r['1d%']:.2f}% | 5d {r['5d%']:.2f}% | "
-                f"RSI {r['RSI14']:.0f} | ΔHi {r['fromHi%']:.2f}%")
-
-    lines.append("\n*Top movers (1d):*")
-    for _, r in top.iterrows(): lines.append("• " + fmt_row(r))
-    lines.append("\n*Bottom movers (1d):*")
-    for _, r in bot.iterrows(): lines.append("• " + fmt_row(r))
-
-    signals = []
-    signals += [f"• *Oversold* RSI<30 → {r['name']} ({r['sym']})"
-                for _, r in df[df["RSI14"] < 30].iterrows()]
-    signals += [f"• *Overbought* RSI>70 → {r['name']} ({r['sym']})"
-                for _, r in df[df["RSI14"] > 70].iterrows()]
-    signals += [f"• *Near 52w High* (<2%): {r['name']} ({r['sym']})"
-                for _, r in df[df["fromHi%"] > -2].iterrows()]  # within 2% of 52w high
-    signals += [f"• *Near 52w Low* (<2%): {r['name']} ({r['sym']})"
-                for _, r in df[df["fromLo%"] < 2].iterrows()]
-
-    lines.append("\n*Signals:*" if signals else "\n*Signals:* None")
-    lines += signals[:10]
-
-    post_slack("\n".join(lines))
+    message = build_message(stats)
+    post_to_slack(message)
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception as exc:
+        # Report failure to Slack and re-raise for debugging
         try:
-            post_slack(f"❌ Market Digest failed: `{e}`")
+            post_to_slack(f"\u274c Market Digest failed: {exc}")
         finally:
             raise
