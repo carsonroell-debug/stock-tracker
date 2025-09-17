@@ -1,0 +1,17 @@
+name: Market Digest (Weekdays 9:30 Toronto)
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"   # 9:30 ET on weekdays (America/Toronto during DST)
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - env:
+          SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: python jobs/market_digest.py
